@@ -80,7 +80,15 @@ export default function App() {
   const [view, setView] = useState<{ t: 'p' | 'm'; i: number; k?: 'A' | 'B' }>({ t: 'p', i: 0 });
   const [sel, setSel] = useState<number | null>(null);
   const [tool, setTool] = useState<'sel' | 'textFrame' | 'imgFrame' | 'pen' | 'drop'>('sel');
-  const [scale, setScale] = useState<number>(1);
+  const [fitScale, setFitScale] = useState<number>(1);
+  const [zoom, setZoom] = useState<number>(1);
+  const scale = fitScale * zoom;
+  const zoomRef = useRef(1);
+  zoomRef.current = zoom;
+  const pinchRef = useRef(false);
+  const pendingScroll = useRef<{ l: number; t: number } | null>(null);
+  const toolRef = useRef<string>('sel');
+  toolRef.current = tool;
   const [col, setCol] = useState<string>('#d81b79');
   const [recent, setRecent] = useState<string[]>([
     '#14161a',
@@ -264,7 +272,7 @@ export default function App() {
     const st = stageRef.current;
     const padding = st.clientWidth < 500 ? 16 : 32;
     const newScale = Math.max(0.05, Math.min((st.clientWidth - padding) / doc.w, (st.clientHeight - padding) / doc.h));
-    setScale(newScale);
+    setFitScale(newScale);
   }, [doc.w, doc.h]);
 
   useEffect(() => {
@@ -280,6 +288,138 @@ export default function App() {
       if (ro) ro.disconnect();
     };
   }, [fit, isSidebarOpen]);
+
+  // ===== Zoom system: buttons, Ctrl+wheel, keyboard, pinch & pan =====
+  const zoomAt = useCallback((nz: number, cx?: number, cy?: number, dx = 0, dy = 0) => {
+    const st = stageRef.current;
+    const z = Math.min(8, Math.max(0.2, nz));
+    if (!st) {
+      setZoom(z);
+      return;
+    }
+    const r = st.getBoundingClientRect();
+    const ax = (cx ?? r.left + r.width / 2) - r.left;
+    const ay = (cy ?? r.top + r.height / 2) - r.top;
+    const ratio = z / zoomRef.current;
+    const sl = pendingScroll.current ? pendingScroll.current.l : st.scrollLeft;
+    const stp = pendingScroll.current ? pendingScroll.current.t : st.scrollTop;
+    const nl = (sl + ax) * ratio - ax - dx;
+    const nt = (stp + ay) * ratio - ay - dy;
+    pendingScroll.current = { l: nl, t: nt };
+    zoomRef.current = z;
+    setZoom(z);
+    requestAnimationFrame(() => {
+      st.scrollLeft = nl;
+      st.scrollTop = nt;
+      pendingScroll.current = null;
+    });
+  }, []);
+
+  const zoomBy = (f: number) => zoomAt(zoomRef.current * f);
+  const zoomFit = () => {
+    zoomAt(1);
+    const st = stageRef.current;
+    if (st) {
+      st.scrollLeft = 0;
+      st.scrollTop = 0;
+    }
+  };
+
+  useEffect(() => {
+    setZoom(1);
+  }, [doc.w, doc.h]);
+
+  useEffect(() => {
+    const st = stageRef.current;
+    if (!st) return;
+    const pts = new Map<number, { x: number; y: number }>();
+    let startDist = 0;
+    let startZoom = 1;
+    let lastMid: { x: number; y: number } | null = null;
+    let pan: { x: number; y: number; l: number; t: number } | null = null;
+    const two = () => {
+      const [a, b] = Array.from(pts.values());
+      return { d: Math.hypot(a.x - b.x, a.y - b.y), m: { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 } };
+    };
+    const down = (e: PointerEvent) => {
+      if (e.pointerType !== 'touch') return;
+      pts.set(e.pointerId, { x: e.clientX, y: e.clientY });
+      if (pts.size === 2) {
+        pinchRef.current = true;
+        pan = null;
+        const t = two();
+        startDist = t.d || 1;
+        startZoom = zoomRef.current;
+        lastMid = t.m;
+      } else if (pts.size === 1 && toolRef.current === 'sel' && !(e.target as HTMLElement).closest('.it')) {
+        pan = { x: e.clientX, y: e.clientY, l: st.scrollLeft, t: st.scrollTop };
+      }
+    };
+    const move = (e: PointerEvent) => {
+      if (!pts.has(e.pointerId)) return;
+      pts.set(e.pointerId, { x: e.clientX, y: e.clientY });
+      if (pts.size === 2 && startDist > 0) {
+        const t = two();
+        const dx = lastMid ? t.m.x - lastMid.x : 0;
+        const dy = lastMid ? t.m.y - lastMid.y : 0;
+        zoomAt(startZoom * (t.d / startDist), t.m.x, t.m.y, dx, dy);
+        lastMid = t.m;
+        e.preventDefault();
+      } else if (pts.size === 1 && pan) {
+        st.scrollLeft = pan.l - (e.clientX - pan.x);
+        st.scrollTop = pan.t - (e.clientY - pan.y);
+      }
+    };
+    const up = (e: PointerEvent) => {
+      pts.delete(e.pointerId);
+      if (pts.size < 2) {
+        startDist = 0;
+        lastMid = null;
+        setTimeout(() => {
+          pinchRef.current = false;
+        }, 60);
+      }
+      if (pts.size === 0) pan = null;
+    };
+    const wheel = (e: WheelEvent) => {
+      if (e.ctrlKey || e.metaKey) {
+        e.preventDefault();
+        zoomAt(zoomRef.current * Math.exp(-e.deltaY * 0.0015), e.clientX, e.clientY);
+      }
+    };
+    st.addEventListener('pointerdown', down, true);
+    st.addEventListener('pointermove', move, true);
+    st.addEventListener('pointerup', up, true);
+    st.addEventListener('pointercancel', up, true);
+    st.addEventListener('wheel', wheel, { passive: false });
+    return () => {
+      st.removeEventListener('pointerdown', down, true);
+      st.removeEventListener('pointermove', move, true);
+      st.removeEventListener('pointerup', up, true);
+      st.removeEventListener('pointercancel', up, true);
+      st.removeEventListener('wheel', wheel);
+    };
+  }, [zoomAt]);
+
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      const ae = document.activeElement as HTMLElement | null;
+      const tag = (ae?.tagName || '').toUpperCase();
+      if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || ae?.getAttribute('contenteditable') === 'true') return;
+      if (e.key === '+' || e.key === '=') {
+        e.preventDefault();
+        zoomAt(zoomRef.current * 1.25);
+      } else if (e.key === '-' || e.key === '_') {
+        e.preventDefault();
+        zoomAt(zoomRef.current * 0.8);
+      } else if (e.key === '0') {
+        e.preventDefault();
+        zoomAt(1);
+      }
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [zoomAt]);
 
   // Initial Load & Stored Templates
   useEffect(() => {
@@ -459,6 +599,7 @@ export default function App() {
     let moved = false;
 
     const onPointerMove = (ev: PointerEvent) => {
+      if (pinchRef.current) return;
       if (!moved) {
         snap();
         moved = true;
@@ -508,6 +649,7 @@ export default function App() {
     snap();
 
     const onPointerMove = (ev: PointerEvent) => {
+      if (pinchRef.current) return;
       const nw = Math.max(20, ow + (ev.clientX - sx) / scale);
       const nh = it.type === 'text' && !it.fixedH ? it.h : Math.max(20, oh + (ev.clientY - sy) / scale);
 
@@ -1256,6 +1398,24 @@ export default function App() {
           onUploadImageClick={() => fileInputRef.current?.click()}
         />
 
+        <div
+          dir="ltr"
+          className="absolute left-3 bottom-3 z-20 flex items-center gap-1 bg-[var(--bar)] border border-[var(--bd)] rounded-xl shadow-lg p-1"
+        >
+          <button className="ps-btn" style={{ minHeight: 40, minWidth: 40, padding: 0, fontSize: 20 }} onClick={() => zoomBy(0.8)} title={isAr ? 'تصغير (-)' : 'Zoom out (-)'} aria-label="Zoom out">
+            −
+          </button>
+          <button className="ps-btn text-xs" style={{ minHeight: 40, minWidth: 54, padding: '0 6px' }} onClick={zoomFit} title={isAr ? 'ملاءمة الشاشة (0)' : 'Fit to screen (0)'}>
+            {Math.round(scale * 100)}%
+          </button>
+          <button className="ps-btn" style={{ minHeight: 40, minWidth: 40, padding: 0, fontSize: 20 }} onClick={() => zoomBy(1.25)} title={isAr ? 'تكبير (+)' : 'Zoom in (+)'} aria-label="Zoom in">
+            +
+          </button>
+          <button className="ps-btn" style={{ minHeight: 40, minWidth: 40, padding: 0, fontSize: 16 }} onClick={zoomFit} title={isAr ? 'ملاءمة الصفحة' : 'Fit page'} aria-label="Fit">
+            ⤢
+          </button>
+        </div>
+
         {isSidebarOpen && (
           <div
             className="md:hidden absolute inset-0 bg-black/40 z-10"
@@ -1268,6 +1428,7 @@ export default function App() {
         <div
           ref={stageRef}
           className="ps-stage flex-1"
+          style={{ touchAction: 'none' }}
           onPointerDown={(e) => {
             if (e.target === stageRef.current) {
               setSel(null);
